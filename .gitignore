@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Env & secrets
+.env
+*.csv   # (be careful: your access key CSV!)
+copilot-dev_accessKeys.csv
+
+# OS cruft
+.DS_Store
+
+# IDE/project files
+.vscode/
+.idea/
