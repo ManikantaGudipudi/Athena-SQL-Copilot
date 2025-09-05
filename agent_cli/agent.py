@@ -1,136 +1,147 @@
 import argparse
 import json
 import re
-from typing import List, Dict
 import requests
+from typing import List, Dict
 
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
 from .config import settings
 from .glue_catalog import get_tables_and_columns
 from .prompts import SYSTEM, FEWSHOTS
 
-import re
 
-def _strip_think(text: str) -> str:
-    """Remove DeepSeek-style <think>...</think> blocks (and similar)."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-
-def _extract_sql_only(text: str) -> str:
-    """
-    Return exactly ONE SQL statement.
-    Strategy:
-      1) Strip <think> blocks.
-      2) If there are ``` fences, pick the first fence that looks like SQL.
-      3) Otherwise, regex-grab the first statement starting with SELECT/WITH/CREATE/DESCRIBE/SHOW up to the first semicolon.
-    """
-    cleaned = _strip_think(text).strip()
-
-    # 2) Handle fenced code blocks first
-    if "```" in cleaned:
-        parts = cleaned.split("```")
-        for p in parts:
-            # remove optional language tag like "sql"
-            body = re.sub(r"^\s*sql\s*", "", p.strip(), flags=re.IGNORECASE)
-            if re.search(r"\b(select|with|create|describe|show)\b", body, flags=re.IGNORECASE):
-                # keep only up to the first semicolon, if present
-                m = re.search(r"(?is)\b(select|with|create|describe|show)\b.*?;", body)
-                return (m.group(0) if m else body).strip()
-
-    # 3) No fences: grab first SQL-looking statement up to semicolon
-    m = re.search(r"(?is)\b(select|with|create|describe|show)\b.*?;", cleaned)
-    if m:
-        return m.group(0).strip()
-
-    # Fallback: return whole thing (last resort)
-    return cleaned
-
+# --- Helpers ---
 def _quote_if_needed(name: str) -> str:
-    """Quote Athena identifiers that are not simple [A-Za-z_][A-Za-z0-9_]* or that start with a digit."""
     if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
         return name
     return f'"{name}"'
 
 def auto_quote_numeric_table_names(sql: str, table_names: List[str]) -> str:
-    """If the schema contains numeric-leading tables (e.g., 2019), ensure they're quoted in SQL."""
     patched = sql
     for t in table_names:
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", t):
-            # replace occurrences of the bare word t with "t"
-            # word boundary approach keeps simple; also handle FROM/JOIN
             patched = re.sub(rf'(?<!")\b{re.escape(t)}\b(?!")', f'"{t}"', patched)
     return patched
 
-def build_messages(tables: List[Dict], question: str) -> list:
-    tbl_str = "\n".join(
+def clean_llm_output(text: str) -> str:
+    """Strip <think> blocks, fences, and return the first SQL statement."""
+    # Remove <think> blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # Look inside fenced blocks
+    if "```" in text:
+        parts = text.split("```")
+        for p in parts:
+            if re.search(r"\b(select|with|create|describe|show)\b", p, flags=re.IGNORECASE):
+                return re.sub(r"^\s*sql", "", p.strip(), flags=re.IGNORECASE)
+
+    # Fallback regex
+    m = re.search(r"(?is)\b(select|with|create|describe|show)\b.*?;", text)
+    if m:
+        return m.group(0).strip()
+
+    return text
+
+
+# --- Tool: run SQL via Chunk 2 API ---
+def run_sql_via_api(sql: str, database: str) -> Dict:
+    if not settings.query_api_base:
+        return {"error": "QUERY_API_BASE not set in .env"}
+    
+    url = f"{settings.query_api_base}/sql"
+    try:
+        r = requests.post(url, json={"query": sql, "database": database}, timeout=120)
+    except Exception as e:
+        return {"error": f"HTTP error: {e}"}
+
+    if r.status_code != 200:
+        return {"error": r.text}
+
+    return r.json()
+
+
+# --- Build schema string for prompt ---
+def schema_string(tables: List[Dict]) -> str:
+    return "\n".join(
         f'- {_quote_if_needed(t["table"])}(columns={t["columns"]}, partitions={t["partitions"]})'
         for t in tables
     )
-    user = f"Tables:\n{tbl_str}\n\nQ: {question}\nSQL:"
-    return [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": FEWSHOTS},
-        {"role": "user", "content": user},
-    ]
 
-def ask_llm(messages: list) -> str:
-    url = f"{settings.openai_base_url}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {"model": settings.model, "messages": messages, "temperature": 0.1}
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"].strip()
 
-    # Use our robust extractor to remove <think> and keep only SQL
-    return _extract_sql_only(content)
-
-def maybe_execute(sql: str, database: str) -> None:
-    if not settings.query_api_base:
-        print("\n[exec skipped] Set QUERY_API_BASE in .env to run SQL via Chunk 2.")
+# --- Main LangChain agent ---
+def run_langchain_agent(question: str, database: str, max_retries: int = 3) -> None:
+    tables = get_tables_and_columns(database)
+    if not tables:
+        print(f"No tables found in Glue database '{database}'.")
         return
-    url = f"{settings.query_api_base}/sql"
-    r = requests.post(url, json={"query": sql, "database": database}, timeout=120)
-    if r.status_code != 200:
-        print("\n[exec error]", r.status_code, r.text)
-        return
-    data = r.json()
-    print("\n-- Execution result --")
-    print("rows:", data.get("row_count"), "| bytes_scanned:", data.get("bytes_scanned"))
-    sample = data.get("rows", [])[:5]
-    for row in sample:
-        print(row)
 
+    schema_info = schema_string(tables)
+
+    # Build prompt
+    template = (
+        SYSTEM + "\n\n"
+        "Here are some examples:\n"
+        f"{FEWSHOTS}\n\n"
+        f"Schema:\n{schema_info}\n\n"
+        "Q: {question}\n"
+        "SQL:"
+    )
+    prompt = ChatPromptTemplate.from_template(template)
+
+    # Initialize Ollama LLM
+    llm = ChatOpenAI(
+        model=settings.model,  # deepseek-r1:7b
+        base_url=settings.openai_base_url,  # http://127.0.0.1:11434/v1
+        api_key=settings.openai_api_key,    # "ollama"
+        temperature=0,
+    )
+
+    # Retry loop
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        print(f"\n=== Attempt {attempt} ===")
+
+        # Generate SQL
+        messages = prompt.format_messages(question=question)
+        raw_reply = llm.invoke(messages).content
+        sql = clean_llm_output(raw_reply)
+        sql = auto_quote_numeric_table_names(sql, [t["table"] for t in tables])
+
+        print(f"[Raw LLM reply]: {raw_reply}")
+        print(f"[Cleaned SQL]: {sql}")
+
+        # Run SQL
+        result = run_sql_via_api(sql, database)
+        if "error" in result:
+            print("\n[exec error]", result["error"])
+            last_error = result["error"]
+            # feed error back into loop
+            question = f"{question}\nFix the SQL based on this error: {last_error}"
+            continue
+
+        # Success
+        print("\n-- Execution result --")
+        print("rows:", result.get("row_count"), "| bytes_scanned:", result.get("bytes_scanned"))
+        for row in result.get("rows", [])[:5]:
+            print(row)
+        return
+
+    print("\n❌ Could not produce a working query after", max_retries, "attempts.")
+    if last_error:
+        print("Last error:", last_error)
+
+
+# --- Entry point ---
 def main():
-    ap = argparse.ArgumentParser(description="Question -> Athena SQL (and optional execute)")
+    ap = argparse.ArgumentParser(description="LangChain Athena Copilot")
     ap.add_argument("--db", default=settings.glue_database)
     ap.add_argument("--question", required=True)
-    ap.add_argument("--execute", action="store_true", help="Run the SQL via Chunk 2 API")
+    ap.add_argument("--max-retries", type=int, default=5)
     args = ap.parse_args()
 
-    # 1) discover schema
-    tables = get_tables_and_columns(args.db)
-    table_names = [t["table"] for t in tables]
-    if not tables:
-        print(f"No tables found in Glue database '{args.db}'.")
-        return
+    run_langchain_agent(args.question, args.db, max_retries=args.max_retries)
 
-    # 2) prompt the LLM
-    msgs = build_messages(tables, args.question)
-    try:
-        sql = ask_llm(msgs)
-    except requests.RequestException as e:
-        print("[LLM error] Could not reach the OpenAI-compatible server:", e)
-        return
-
-    # 3) patch numeric-leading table names (e.g., 2019 -> "2019")
-    sql_patched = auto_quote_numeric_table_names(sql, table_names)
-
-    print("\n-- Proposed SQL --\n" + sql_patched)
-
-    # 4) optional execute via Query API
-    if args.execute:
-        maybe_execute(sql_patched, args.db)
 
 if __name__ == "__main__":
     main()
