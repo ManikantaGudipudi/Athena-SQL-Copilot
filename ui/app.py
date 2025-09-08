@@ -61,11 +61,11 @@ else:
     if st.button("Ask"):
         if question.strip():
             with st.spinner("Generating SQL via agent..."):
-                # Call the agent CLI as a subprocess
-                import subprocess, sys
-                cmd = [sys.executable, "-m", AGENT_ENTRYPOINT, "--db", db, "--question", question, "--execute"]
+                agent_api_url = os.getenv("AGENT_API_URL")  # set this in EB env
                 try:
-                    output = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-                    st.code(output, language="bash")
-                except subprocess.CalledProcessError as e:
-                    st.error(f"Agent failed:\n{e.output}")
+                    r = requests.post(agent_api_url, json={"question": question}, timeout=120)
+                    r.raise_for_status()
+                    result = r.json()
+                    st.json(result)   # show SQL + result JSON
+                except Exception as e:
+                    st.error(f"Agent failed: {e}")
